@@ -1,0 +1,1636 @@
+---
+title: "IoT-23 Cybersecurity Intrusion Detection Analysis"
+author: "Atkiya Anisa Latifi,Fahad Ibne Firoz, Sahed Ahmed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+
+required_packages <- c(
+  "tidyverse", "janitor", "naniar", "skimr", "e1071",
+  "ggcorrplot", "caret", "knitr", "kableExtra",
+  "factoextra", "randomForest", "pROC"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+
+theme_set(theme_minimal())
+```
+
+## 1. Problem Framing
+
+### 1.1 Domain Context and Dataset Background
+
+Cybersecurity intrusion detection is the process of identifying suspicious or malicious network activity. This project uses the **IoT-23** dataset created by the Stratosphere Laboratory at the Czech Technical University in Prague. The selected scenario is **CTU-IoT-Malware-Capture-34-1**, which contains network traffic from a Raspberry Pi infected with Mirai malware.
+
+The dataset contains Zeek network-flow information such as protocol, service, connection state, duration, byte counts, packet counts, and port numbers. The original IoT-23 label is converted into a binary target named `attack_status`, where the two classes are **Benign** and **Malicious**.
+
+### 1.2 Research Questions
+
+1. Which network-flow characteristics differ most between benign and malicious IoT traffic?
+2. How do protocol, connection state, duration, packet activity, and traffic volume differ between the two traffic classes?
+3. Can a machine-learning model use the selected network-flow features to distinguish malicious traffic from benign traffic?
+
+### 1.3 Success Criteria and Evaluation Metrics
+
+The project will be considered successful if the models can separate malicious and benign traffic better than random guessing and if the improved model performs at least as well as the baseline model on the main evaluation measures.
+
+For this course project, the following practical benchmarks are used:
+
+- ROC-AUC of at least **0.80**.
+- Recall of at least **0.80** for the Malicious class.
+- F1-score is considered together with precision and recall.
+- The improved model is compared directly with the baseline model.
+
+The classification metrics used are **Accuracy, Precision, Recall, F1-score, and ROC-AUC**. Recall is especially important because a false negative means that malicious traffic was missed.
+
+### 1.4 Dataset Justification
+
+The selected IoT-23 scenario is appropriate for this project because it is a real-world cybersecurity dataset from a public research repository, contains more than 500 rows and more than 8 variables, includes both numeric and categorical variables, has a clear classification target, and contains missing or unset fields together with extreme network-flow values. It therefore supports data inspection, exploratory analysis, preprocessing, feature engineering, feature selection, PCA, classification modelling, and evaluation.
+
+## 2. Data Acquisition and Initial Inspection
+
+### 2.1 Load the Dataset from a Public URL
+
+The data are loaded directly from the official public CTU repository. The source file is a labeled Zeek connection log, so `read_tsv()` is used as the equivalent direct-URL reading function.
+
+```{r load-data}
+iot23_url <- paste0(
+  "https://mcfp.felk.cvut.cz/publicDatasets/IoT-23-Dataset-v2/",
+  "CTU-IoT-Malware-Capture-34-1/",
+  "2018-12-21-15-50-14-192.168.1.195-zeek-conn-log.labeled"
+)
+
+raw_names <- c(
+  "ts", "uid", "id_orig_h", "id_orig_p", "id_resp_h", "id_resp_p",
+  "proto", "service", "duration", "orig_bytes", "resp_bytes",
+  "conn_state", "local_orig", "local_resp", "missed_bytes", "history",
+  "orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes",
+  "label_info"
+)
+
+iot23_raw <- readr::read_tsv(
+  iot23_url,
+  comment = "#",
+  col_names = raw_names,
+  na = c("-", "(empty)"),
+  trim_ws = TRUE,
+  show_col_types = FALSE,
+  progress = FALSE
+)
+
+label_parts <- stringr::str_split_fixed(
+  stringr::str_squish(iot23_raw$label_info),
+  "\\s+",
+  3
+)
+
+cyber_data <- iot23_raw %>%
+  mutate(
+    tunnel_parents = na_if(label_parts[, 1], "-"),
+    label = label_parts[, 2],
+    detailed_label = na_if(label_parts[, 3], "-")
+  ) %>%
+  select(-label_info) %>%
+  janitor::clean_names() %>%
+  mutate(
+    attack_status = factor(
+      if_else(label == "Benign", "Benign", "Malicious"),
+      levels = c("Benign", "Malicious")
+    ),
+    timestamp = as.POSIXct(ts, origin = "1970-01-01", tz = "UTC")
+  )
+```
+
+#### Observation
+
+The dataset is loaded directly from the public source without using a local data file. The target variable `attack_status` is created from the original IoT-23 label.
+
+### 2.2 Dataset Dimensions
+
+```{r dimensions}
+dimension_table <- data.frame(
+  Rows = nrow(cyber_data),
+  Columns = ncol(cyber_data)
+)
+
+kable(dimension_table, caption = "Dataset Dimensions") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The selected dataset contains **`r nrow(cyber_data)` rows** and **`r ncol(cyber_data)` columns**, so it exceeds the minimum requirement of 500 rows and 8 variables.
+
+### 2.3 First Six Rows
+
+```{r first-six-rows}
+head(cyber_data) %>%
+  kable(caption = "First Six Rows of the IoT-23 Dataset") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The first six rows confirm that the dataset includes identifiers, network-flow measurements, categorical connection information, original labels, and the derived binary target.
+
+### 2.4 Variable Types
+
+```{r variable-types}
+glimpse(cyber_data)
+```
+
+#### Observation
+
+The dataset contains a mixture of numeric variables such as duration, bytes, packets, and ports, together with categorical variables such as protocol, service, connection state, and labels.
+
+### 2.5 Full Summary Statistics
+
+```{r skim-summary}
+skimr::skim(cyber_data)
+```
+
+#### Observation
+
+The `skim()` output provides a complete summary of variable types, missing values, ranges, central tendency, and distributions. It also shows which variables need preprocessing before modelling.
+
+### 2.6 Data Provenance
+
+**Dataset:** IoT-23, scenario CTU-IoT-Malware-Capture-34-1  
+**Source:** Stratosphere Laboratory, Czech Technical University in Prague  
+**Direct URL:** <https://mcfp.felk.cvut.cz/publicDatasets/IoT-23-Dataset-v2/CTU-IoT-Malware-Capture-34-1/2018-12-21-15-50-14-192.168.1.195-zeek-conn-log.labeled>
+
+The network traffic was captured from an IoT Raspberry Pi in a malware-capture environment. The packet traffic was processed into labeled Zeek connection flows. The selected capture focuses on Mirai malware.
+
+Known limitations include the use of only one IoT-23 scenario, possible class imbalance, missing or unset Zeek fields, extreme network-flow measurements, and limited generalisability to other malware families, devices, or networks.
+
+## 3. Exploratory Data Analysis
+
+### 3.1 EDA Preparation and Target Distribution
+
+```{r target-distribution}
+eda_data <- cyber_data %>%
+  mutate(
+    total_bytes_eda = coalesce(orig_bytes, 0) + coalesce(resp_bytes, 0),
+    total_packets_eda = coalesce(orig_pkts, 0) + coalesce(resp_pkts, 0),
+    bytes_per_packet_eda = total_bytes_eda / (total_packets_eda + 1)
+  )
+
+class_counts <- eda_data %>%
+  count(attack_status) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+dominant_class <- as.character(class_counts$attack_status[which.max(class_counts$n)])
+dominant_percentage <- max(class_counts$Percentage)
+
+kable(class_counts, caption = "Target Class Distribution") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(eda_data, aes(x = attack_status, fill = attack_status)) +
+  geom_bar() +
+  labs(
+    title = "Benign and Malicious Network Flows",
+    x = "Traffic Class",
+    y = "Number of Flows"
+  ) +
+  theme(legend.position = "none")
+```
+
+#### Observation
+
+The majority class is **`r dominant_class`**, representing approximately **`r dominant_percentage`%** of the observations. This class imbalance is important because accuracy alone may give a misleading view of model quality.
+
+### 3.2 Missing Value Analysis
+
+```{r missing-analysis}
+missing_summary <- naniar::miss_var_summary(cyber_data)
+
+top_missing <- missing_summary %>%
+  arrange(desc(n_miss)) %>%
+  slice(1)
+
+kable(missing_summary, caption = "Missing Values by Variable") %>%
+  kable_styling(full_width = FALSE)
+
+naniar::gg_miss_var(cyber_data) +
+  labs(
+    title = "Missing Values in IoT-23 Variables",
+    x = "Variable",
+    y = "Number of Missing Values"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### Observation
+
+The variable with the largest number of missing values is **`r top_missing$variable[1]`**, with **`r top_missing$n_miss[1]`** missing observations. Missing values are handled explicitly in Section 4 instead of deleting the full rows.
+
+### 3.3 Skewness Analysis
+
+```{r skewness-analysis}
+numeric_data <- cyber_data %>%
+  select(where(is.numeric), -ts)
+
+skew_table <- data.frame(
+  Variable = names(numeric_data),
+  Skewness = sapply(
+    numeric_data,
+    function(x) {
+      x2 <- x[!is.na(x)]
+      if (length(unique(x2)) <= 1) {
+        0
+      } else {
+        e1071::skewness(x2, type = 2)
+      }
+    }
+  )
+) %>%
+  mutate(
+    Skewness = round(Skewness, 3),
+    Shape = case_when(
+      abs(Skewness) < 0.5 ~ "Approximately symmetric",
+      abs(Skewness) < 1 ~ "Moderately skewed",
+      TRUE ~ "Highly skewed"
+    ),
+    Transformation_Warranted = case_when(
+      Variable %in% c("id_orig_p", "id_resp_p") ~ "No",
+      abs(Skewness) >= 1 ~ "Yes",
+      TRUE ~ "No"
+    ),
+    Reason = case_when(
+      Variable %in% c("id_orig_p", "id_resp_p") ~ "Port values are endpoint identifiers, so a log transformation is not meaningful.",
+      Skewness >= 1 ~ "The variable has a long right tail, so a log1p transformation can reduce skewness.",
+      Skewness <= -1 ~ "The variable has a long left tail, so a transformation may improve symmetry.",
+      TRUE ~ "The skewness is not severe enough to require transformation."
+    )
+  )
+
+kable(skew_table, caption = "Skewness and Transformation Decisions") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The table gives a transformation decision and a reason for every numeric variable. Highly right-skewed traffic measurements are later represented with log-transformed engineered features where useful, while port numbers are not transformed because they act as network identifiers rather than continuous measurements.
+
+### 3.4 Protocol Distribution
+
+```{r protocol-distribution}
+protocol_counts <- eda_data %>%
+  count(proto, sort = TRUE)
+
+top_protocol <- as.character(protocol_counts$proto[1])
+top_protocol_count <- protocol_counts$n[1]
+
+ggplot(eda_data, aes(x = proto)) +
+  geom_bar() +
+  labs(
+    title = "Protocol Distribution",
+    x = "Protocol",
+    y = "Number of Flows"
+  )
+```
+
+#### Observation
+
+The most common protocol is **`r top_protocol`**, appearing in **`r top_protocol_count`** flows. This shows that the selected capture is dominated by a particular network protocol rather than being evenly distributed across protocols.
+
+### 3.5 Connection State Distribution
+
+```{r connection-state-distribution}
+connection_state_counts <- eda_data %>%
+  count(conn_state, sort = TRUE)
+
+top_connection_state <- as.character(connection_state_counts$conn_state[1])
+top_connection_state_count <- connection_state_counts$n[1]
+
+ggplot(
+  connection_state_counts,
+  aes(x = reorder(conn_state, n), y = n)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Connection State Distribution",
+    x = "Connection State",
+    y = "Number of Flows"
+  )
+```
+
+#### Observation
+
+The most common connection state is **`r top_connection_state`**, appearing in **`r top_connection_state_count`** flows. The distribution shows that network-flow states are not equally represented, so connection state may provide useful information about typical and unusual traffic behaviour.
+
+### 3.6 Total Packet Activity Distribution
+
+```{r packet-distribution}
+median_total_packets <- median(eda_data$total_packets_eda, na.rm = TRUE)
+
+ggplot(eda_data, aes(x = log1p(total_packets_eda))) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of Total Packets per Flow",
+    x = "log(1 + Total Packets)",
+    y = "Frequency"
+  )
+```
+
+#### Observation
+
+The median total packet count is **`r round(median_total_packets, 2)` packets per flow**. The log-scaled distribution makes the long right tail easier to inspect and shows that most flows use relatively few packets while a smaller number contain much heavier packet activity.
+
+### 3.7 Flow Duration Distribution
+
+```{r duration-distribution}
+median_duration <- median(eda_data$duration, na.rm = TRUE)
+
+ggplot(eda_data, aes(x = log1p(duration))) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of Flow Duration",
+    x = "log(1 + Duration)",
+    y = "Frequency"
+  )
+```
+
+#### Observation
+
+The median flow duration is **`r round(median_duration, 4)`**. A log scale is used because the duration distribution has a long right tail, allowing both short and long connections to be viewed more clearly.
+
+### 3.8 Total Traffic Volume Distribution
+
+```{r byte-distribution}
+median_total_bytes <- median(eda_data$total_bytes_eda, na.rm = TRUE)
+
+ggplot(eda_data, aes(x = log1p(total_bytes_eda))) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of Total Bytes per Flow",
+    x = "log(1 + Total Bytes)",
+    y = "Frequency"
+  )
+```
+
+#### Observation
+
+The median total traffic volume is **`r round(median_total_bytes, 2)` bytes per flow**. The distribution is strongly right-skewed, with a smaller number of flows transferring much larger amounts of data.
+
+### 3.9 Bivariate Analysis: Duration and Target
+
+```{r duration-vs-target}
+duration_summary <- eda_data %>%
+  group_by(attack_status) %>%
+  summarise(
+    Median_Duration = median(duration, na.rm = TRUE),
+    Mean_Duration = mean(duration, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(duration_summary, digits = 4, caption = "Flow Duration by Traffic Class") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(eda_data, aes(x = attack_status, y = log1p(duration), fill = attack_status)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Flow Duration by Traffic Class",
+    x = "Traffic Class",
+    y = "log(1 + Duration)"
+  ) +
+  theme(legend.position = "none")
+```
+
+#### Observation
+
+The median duration is **`r round(duration_summary$Median_Duration[duration_summary$attack_status == "Benign"], 4)`** for benign flows and **`r round(duration_summary$Median_Duration[duration_summary$attack_status == "Malicious"], 4)`** for malicious flows. This indicates that flow duration behaves differently across the two classes and may provide useful classification information.
+
+### 3.10 Bivariate Analysis: Packet and Byte Activity
+
+```{r packet-byte-scatter}
+packet_byte_cor <- cor(
+  log1p(eda_data$total_packets_eda),
+  log1p(eda_data$total_bytes_eda),
+  use = "complete.obs"
+)
+
+ggplot(
+  eda_data,
+  aes(
+    x = log1p(total_packets_eda),
+    y = log1p(total_bytes_eda),
+    color = attack_status
+  )
+) +
+  geom_point(alpha = 0.25) +
+  labs(
+    title = "Packet Activity and Traffic Volume",
+    x = "log(1 + Total Packets)",
+    y = "log(1 + Total Bytes)",
+    color = "Traffic Class"
+  )
+```
+
+#### Observation
+
+The correlation between log total packets and log total bytes is **`r round(packet_byte_cor, 3)`**. The scatter plot also shows whether benign and malicious flows occupy different regions of the packet-volume relationship.
+
+### 3.11 Bivariate Analysis: Protocol and Target
+
+```{r protocol-vs-target}
+protocol_target <- eda_data %>%
+  count(proto, attack_status) %>%
+  group_by(proto) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup()
+
+malicious_protocol_summary <- protocol_target %>%
+  filter(attack_status == "Malicious") %>%
+  arrange(desc(Proportion))
+
+top_malicious_protocol <- as.character(malicious_protocol_summary$proto[1])
+top_malicious_protocol_percentage <- malicious_protocol_summary$Proportion[1] * 100
+
+ggplot(eda_data, aes(x = proto, fill = attack_status)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Traffic Class Proportion by Protocol",
+    x = "Protocol",
+    y = "Proportion",
+    fill = "Traffic Class"
+  )
+```
+
+#### Observation
+
+The protocol with the highest malicious proportion is **`r top_malicious_protocol`**, with approximately **`r round(top_malicious_protocol_percentage, 2)`%** malicious flows. This shows that attack prevalence differs across protocols, so protocol can contribute useful classification information.
+
+### 3.12 Connection State and Target
+
+```{r connection-state-vs-target}
+connection_state_target <- eda_data %>%
+  count(conn_state, attack_status) %>%
+  group_by(conn_state) %>%
+  mutate(
+    Total = sum(n),
+    Proportion = n / Total
+  ) %>%
+  ungroup() %>%
+  filter(Total >= 20)
+
+malicious_state_summary <- connection_state_target %>%
+  filter(attack_status == "Malicious") %>%
+  arrange(desc(Proportion))
+
+top_malicious_state <- as.character(malicious_state_summary$conn_state[1])
+top_malicious_state_percentage <- malicious_state_summary$Proportion[1] * 100
+
+ggplot(
+  connection_state_target,
+  aes(x = reorder(conn_state, Total), y = n, fill = attack_status)
+) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  labs(
+    title = "Traffic Class Proportion by Connection State",
+    x = "Connection State",
+    y = "Proportion",
+    fill = "Traffic Class"
+  )
+```
+
+#### Observation
+
+Among connection states with at least 20 flows, **`r top_malicious_state`** has the highest malicious proportion at approximately **`r round(top_malicious_state_percentage, 2)`%**. This confirms that connection-state behaviour differs across traffic classes and can contribute useful information to intrusion detection.
+
+### 3.13 Correlation Analysis
+
+```{r correlation-analysis}
+cor_data <- eda_data %>%
+  select(
+    id_orig_p, id_resp_p, duration, orig_bytes, resp_bytes,
+    missed_bytes, orig_pkts, orig_ip_bytes, resp_pkts, resp_ip_bytes,
+    total_bytes_eda, total_packets_eda, bytes_per_packet_eda
+  ) %>%
+  select(where(~ dplyr::n_distinct(.x, na.rm = TRUE) > 1))
+
+cor_matrix <- cor(cor_data, use = "pairwise.complete.obs")
+
+upper_positions <- which(upper.tri(cor_matrix), arr.ind = TRUE)
+
+correlation_pairs <- data.frame(
+  Feature_1 = rownames(cor_matrix)[upper_positions[, 1]],
+  Feature_2 = colnames(cor_matrix)[upper_positions[, 2]],
+  Correlation = cor_matrix[upper_positions]
+) %>%
+  mutate(
+    Absolute_Correlation = abs(Correlation),
+    Direction = if_else(Correlation >= 0, "Positive", "Negative")
+  ) %>%
+  arrange(desc(Absolute_Correlation))
+
+strong_cor_pairs <- correlation_pairs %>%
+  filter(Absolute_Correlation >= 0.70)
+
+strongest_pair <- correlation_pairs %>%
+  slice(1)
+
+ggcorrplot(
+  cor_matrix,
+  lab = TRUE,
+  type = "lower",
+  outline.color = "white"
+)
+
+if (nrow(strong_cor_pairs) > 0) {
+  strong_cor_pairs %>%
+    select(Feature_1, Feature_2, Correlation, Direction) %>%
+    mutate(Correlation = round(Correlation, 3)) %>%
+    kable(caption = "Strong Correlation Pairs with |r| >= 0.70") %>%
+    kable_styling(full_width = FALSE)
+} else {
+  cat("No numeric feature pairs have an absolute correlation of 0.70 or higher.")
+}
+```
+
+#### Observation
+
+The strongest numeric relationship is between **`r strongest_pair$Feature_1[1]`** and **`r strongest_pair$Feature_2[1]`**, with a **`r strongest_pair$Direction[1]` correlation of `r round(strongest_pair$Correlation[1], 3)`**. Strongly correlated variables can create multicollinearity because they contain overlapping information. A correlation-based feature-selection step is therefore applied later to reduce redundancy.
+
+### 3.14 Non-Obvious Finding: Bytes per Packet
+
+```{r non-obvious-finding}
+bytes_packet_summary <- eda_data %>%
+  group_by(attack_status) %>%
+  summarise(
+    Median_Bytes_Per_Packet = median(bytes_per_packet_eda, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+benign_bpp <- bytes_packet_summary$Median_Bytes_Per_Packet[
+  bytes_packet_summary$attack_status == "Benign"
+]
+
+malicious_bpp <- bytes_packet_summary$Median_Bytes_Per_Packet[
+  bytes_packet_summary$attack_status == "Malicious"
+]
+
+bpp_direction <- ifelse(
+  malicious_bpp < benign_bpp,
+  "lower",
+  ifelse(malicious_bpp > benign_bpp, "higher", "approximately equal")
+)
+
+kable(
+  bytes_packet_summary,
+  digits = 2,
+  caption = "Median Bytes per Packet by Traffic Class"
+) %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(
+  eda_data,
+  aes(x = attack_status, y = log1p(bytes_per_packet_eda), fill = attack_status)
+) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA) +
+  labs(
+    title = "Bytes per Packet by Traffic Class",
+    x = "Traffic Class",
+    y = "log(1 + Bytes per Packet)"
+  ) +
+  theme(legend.position = "none")
+```
+
+#### Observation
+
+The median bytes per packet for malicious flows is **`r round(malicious_bpp, 2)`**, compared with **`r round(benign_bpp, 2)`** for benign flows. Malicious traffic therefore has **`r bpp_direction`** bytes per packet in this capture. This is a useful non-obvious finding because two flows can transfer a similar total volume while using packets differently.
+
+## 4. Data Preprocessing and Feature Engineering
+
+### 4.1 Missing Value Treatment
+
+```{r missing-treatment}
+clean_data <- cyber_data
+
+clean_data <- clean_data %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)
+    )
+  )
+
+categorical_missing_vars <- c(
+  "service", "local_orig", "local_resp", "history",
+  "tunnel_parents", "detailed_label"
+)
+
+clean_data <- clean_data %>%
+  mutate(
+    across(
+      all_of(categorical_missing_vars),
+      ~ replace_na(as.character(.x), "Unknown")
+    )
+  )
+
+missing_strategy <- data.frame(
+  Variable_Type = c("Numeric", "Categorical"),
+  Treatment = c("Median imputation", "Replace missing value with Unknown"),
+  Justification = c(
+    "The median is less affected by extreme network-flow values than the mean.",
+    "Unknown keeps the record while clearly representing an unavailable category."
+  )
+)
+
+kable(missing_strategy, caption = "Missing Value Treatment Strategy") %>%
+  kable_styling(full_width = FALSE)
+
+remaining_missing <- sum(is.na(clean_data))
+```
+
+#### Observation
+
+Numeric missing values are replaced with the median because traffic measurements contain extreme values. Missing categorical values are kept as an explicit `Unknown` category. After treatment, **`r remaining_missing`** missing values remain in `clean_data`.
+
+### 4.2 Duplicate Treatment
+
+```{r duplicate-treatment}
+duplicate_count <- sum(duplicated(clean_data))
+
+clean_data <- clean_data %>%
+  distinct()
+
+duplicate_result <- data.frame(
+  Duplicate_Rows_Found = duplicate_count,
+  Rows_After_Removal = nrow(clean_data)
+)
+
+kable(duplicate_result, caption = "Duplicate Row Check") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+A total of **`r duplicate_count`** exact duplicate rows were identified. Exact duplicates are removed so that repeated records do not receive extra weight in later analysis.
+
+### 4.3 Outlier Detection and Treatment
+
+```{r outlier-analysis}
+count_iqr_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr_value <- IQR(x, na.rm = TRUE)
+  lower <- q1 - 1.5 * iqr_value
+  upper <- q3 + 1.5 * iqr_value
+  sum(x < lower | x > upper, na.rm = TRUE)
+}
+
+outlier_variables <- c(
+  "duration", "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts"
+)
+
+outlier_table <- data.frame(
+  Variable = outlier_variables,
+  IQR_Outliers = sapply(clean_data[outlier_variables], count_iqr_outliers)
+)
+
+largest_outlier_var <- outlier_table$Variable[which.max(outlier_table$IQR_Outliers)]
+largest_outlier_count <- max(outlier_table$IQR_Outliers)
+
+kable(outlier_table, caption = "IQR Outlier Counts") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(clean_data, aes(y = log1p(orig_bytes + resp_bytes))) +
+  geom_boxplot() +
+  labs(
+    title = "Boxplot of Total Flow Bytes",
+    y = "log(1 + Total Bytes)"
+  )
+```
+
+#### Observation
+
+The IQR method identifies extreme values, with **`r largest_outlier_var`** containing the largest detected outlier count of **`r largest_outlier_count`**. The outliers are retained because unusually large or long flows can represent genuine attack behaviour. Log-transformed features are created instead of deleting potentially important security events.
+
+### 4.4 Feature Engineering
+
+```{r feature-engineering}
+clean_data <- clean_data %>%
+  mutate(
+    total_bytes = orig_bytes + resp_bytes,
+    total_packets = orig_pkts + resp_pkts,
+    bytes_per_packet = total_bytes / (total_packets + 1),
+    log_duration = log1p(duration),
+    log_total_bytes = log1p(total_bytes),
+    hour = as.integer(format(timestamp, "%H")),
+    time_period = case_when(
+      hour >= 0 & hour < 6 ~ "Night",
+      hour >= 6 & hour < 12 ~ "Morning",
+      hour >= 12 & hour < 18 ~ "Afternoon",
+      TRUE ~ "Evening"
+    )
+  )
+
+engineered_features <- data.frame(
+  Feature = c(
+    "total_bytes", "total_packets", "bytes_per_packet",
+    "log_duration", "log_total_bytes", "hour", "time_period"
+  ),
+  Purpose = c(
+    "Measures total traffic volume in both directions.",
+    "Measures total packet activity in both directions.",
+    "Measures average traffic intensity per packet.",
+    "Reduces right-skewness in flow duration.",
+    "Reduces right-skewness in total traffic volume.",
+    "Extracts the hour of the day from the timestamp.",
+    "Groups the hour into an easy-to-interpret time category."
+  )
+)
+
+kable(engineered_features, caption = "Engineered Features and Their Purpose") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+Seven new variables are created. These features summarise traffic volume, packet behaviour, skewed measurements, and time information, so feature engineering adds new information rather than simply removing columns.
+
+### 4.5 Categorical Encoding Preparation
+
+```{r factor-conversion}
+clean_data <- clean_data %>%
+  mutate(
+    proto = as.factor(proto),
+    service = as.factor(service),
+    conn_state = as.factor(conn_state),
+    time_period = as.factor(time_period),
+    attack_status = factor(
+      attack_status,
+      levels = c("Benign", "Malicious")
+    )
+  )
+
+factor_summary <- data.frame(
+  Variable = c("proto", "service", "conn_state", "time_period"),
+  Number_of_Levels = c(
+    nlevels(clean_data$proto),
+    nlevels(clean_data$service),
+    nlevels(clean_data$conn_state),
+    nlevels(clean_data$time_period)
+  )
+)
+
+kable(factor_summary, caption = "Categorical Variables Prepared for Encoding") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The modelling categorical variables are converted to factors so that they can be converted into dummy variables in a consistent way.
+
+### 4.6 Predictor Set and Target Leakage Prevention
+
+```{r modelling-feature-set}
+model_data <- clean_data %>%
+  select(
+    attack_status,
+    id_orig_p, id_resp_p,
+    proto, service, conn_state,
+    duration, orig_bytes, resp_bytes, missed_bytes,
+    orig_pkts, orig_ip_bytes, resp_pkts, resp_ip_bytes,
+    total_bytes, total_packets, bytes_per_packet,
+    log_duration, log_total_bytes,
+    hour, time_period
+  )
+
+glimpse(model_data)
+```
+
+#### Observation
+
+Unique IDs, source and destination IP addresses, the original label variables, and the full timestamp are excluded from the predictor set. The original labels are not used as predictors because they would directly reveal the target and create target leakage.
+
+### 4.7 Numeric Scaling
+
+```{r numeric-scaling}
+continuous_features <- c(
+  "id_orig_p", "id_resp_p", "duration", "orig_bytes", "resp_bytes",
+  "missed_bytes", "orig_pkts", "orig_ip_bytes", "resp_pkts",
+  "resp_ip_bytes", "total_bytes", "total_packets", "bytes_per_packet",
+  "log_duration", "log_total_bytes", "hour"
+)
+
+scaled_model_data <- model_data
+
+scale_features <- continuous_features[
+  sapply(
+    scaled_model_data[continuous_features],
+    function(x) sd(x, na.rm = TRUE) > 0
+  )
+]
+
+scaled_model_data[scale_features] <- scale(
+  scaled_model_data[scale_features]
+)
+
+scaling_table <- data.frame(
+  Scaled_Features = scale_features
+)
+
+kable(scaling_table, caption = "Numeric Features Standardised with Z-Scores") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+Z-score standardisation places continuous variables on comparable scales. This is particularly useful for PCA and coefficient-based models such as Logistic Regression.
+
+### 4.8 One-Hot Encoding
+
+```{r one-hot-encoding}
+dummy_encoder <- caret::dummyVars(
+  attack_status ~ .,
+  data = scaled_model_data,
+  fullRank = TRUE
+)
+
+encoded_predictors <- predict(
+  dummy_encoder,
+  newdata = scaled_model_data
+) %>%
+  as.data.frame()
+
+encoded_data <- encoded_predictors %>%
+  mutate(attack_status = scaled_model_data$attack_status)
+
+encoding_result <- data.frame(
+  Predictors_Before_Encoding = ncol(scaled_model_data) - 1,
+  Predictors_After_Encoding = ncol(encoded_predictors)
+)
+
+kable(encoding_result, caption = "One-Hot Encoding Summary") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+One-hot encoding converts categorical variables into numeric dummy variables. The predictor count changes from **`r ncol(scaled_model_data) - 1`** to **`r ncol(encoded_predictors)`**, making the dataset suitable for PCA and machine-learning algorithms.
+
+### 4.9 Principled Feature Selection
+
+```{r feature-selection}
+predictor_data <- encoded_data %>%
+  select(-attack_status)
+
+nzv_index <- caret::nearZeroVar(predictor_data)
+
+if (length(nzv_index) > 0) {
+  predictor_after_nzv <- predictor_data[, -nzv_index, drop = FALSE]
+} else {
+  predictor_after_nzv <- predictor_data
+}
+
+cor_selected <- cor(predictor_after_nzv, use = "pairwise.complete.obs")
+cor_selected[is.na(cor_selected)] <- 0
+
+high_cor_index <- caret::findCorrelation(
+  cor_selected,
+  cutoff = 0.90
+)
+
+if (length(high_cor_index) > 0) {
+  predictor_selected <- predictor_after_nzv[, -high_cor_index, drop = FALSE]
+} else {
+  predictor_selected <- predictor_after_nzv
+}
+
+selected_data <- predictor_selected %>%
+  mutate(attack_status = encoded_data$attack_status)
+
+selection_summary <- data.frame(
+  Stage = c(
+    "Encoded predictors",
+    "After near-zero-variance filter",
+    "After correlation filter"
+  ),
+  Number_of_Predictors = c(
+    ncol(predictor_data),
+    ncol(predictor_after_nzv),
+    ncol(predictor_selected)
+  )
+)
+
+retained_features <- data.frame(
+  Retained_Feature = names(predictor_selected)
+)
+
+kable(selection_summary, caption = "Feature Selection Summary") %>%
+  kable_styling(full_width = FALSE)
+
+kable(retained_features, caption = "Features Retained for Phase 2") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+Feature selection first removes predictors with almost no variation and then removes one variable from highly correlated pairs above the 0.90 correlation threshold. The final dataset retains **`r ncol(predictor_selected)` predictors**, reducing redundant information in a principled way.
+
+### 4.10 Final Cleaned and Selected Data Frame
+
+```{r final-selected-data}
+head(selected_data) %>%
+  kable(caption = "Preview of the Final Selected Feature Set") %>%
+  kable_styling(full_width = FALSE)
+
+glimpse(selected_data)
+```
+
+#### Observation
+
+`selected_data` is the cleaned, engineered, scaled, encoded, and feature-selected data frame saved for Phase 2 analysis.
+
+## 5. Dimensionality Reduction with PCA
+
+### 5.1 Prepare Numeric PCA Data
+
+```{r pca-preparation}
+pca_input <- selected_data %>%
+  select(-attack_status)
+
+glimpse(pca_input)
+```
+
+#### Observation
+
+The target is excluded from PCA because PCA is an unsupervised dimensionality-reduction method. All remaining variables are numeric predictors.
+
+### 5.2 Apply PCA
+
+```{r pca-model}
+pca_model <- prcomp(
+  pca_input,
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_variance <- pca_model$sdev^2 / sum(pca_model$sdev^2)
+pca_cumulative <- cumsum(pca_variance)
+
+pca_table <- data.frame(
+  Component = paste0("PC", seq_along(pca_variance)),
+  Variance_Percent = round(pca_variance * 100, 2),
+  Cumulative_Percent = round(pca_cumulative * 100, 2)
+)
+
+head(pca_table, 10) %>%
+  kable(caption = "Explained Variance of the First 10 Principal Components") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The explained-variance table shows how much variation each principal component captures and how quickly the cumulative information increases.
+
+### 5.3 Scree Plot
+
+```{r pca-scree-plot}
+number_to_show <- min(20, ncol(pca_input))
+
+factoextra::fviz_eig(
+  pca_model,
+  ncp = number_to_show,
+  addlabels = TRUE
+) +
+  labs(
+    title = "PCA Scree Plot",
+    x = "Principal Component",
+    y = "Variance Explained (%)"
+  )
+```
+
+#### Observation
+
+The scree plot shows that earlier principal components explain more variance, while later components add progressively less information.
+
+### 5.4 Cumulative Explained Variance and Component Choice
+
+```{r cumulative-variance}
+selected_pc_count <- which(pca_cumulative >= 0.80)[1]
+selected_pc_variance <- pca_cumulative[selected_pc_count] * 100
+
+cumulative_plot_data <- data.frame(
+  Component_Number = seq_along(pca_cumulative),
+  Cumulative_Variance = pca_cumulative * 100
+)
+
+ggplot(
+  cumulative_plot_data,
+  aes(x = Component_Number, y = Cumulative_Variance)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 80, linetype = "dashed") +
+  geom_vline(xintercept = selected_pc_count, linetype = "dashed") +
+  labs(
+    title = "Cumulative Variance Explained by PCA",
+    x = "Number of Principal Components",
+    y = "Cumulative Variance Explained (%)"
+  )
+
+pca_choice <- data.frame(
+  Selected_Components = selected_pc_count,
+  Variance_Explained_Percent = round(selected_pc_variance, 2)
+)
+
+kable(pca_choice, caption = "Selected Number of Principal Components") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+Using an 80% cumulative-variance rule, the first **`r selected_pc_count` principal components** are selected. Together they explain approximately **`r round(selected_pc_variance, 2)`%** of the total predictor variance.
+
+### 5.5 PCA Biplot
+
+```{r pca-biplot}
+factoextra::fviz_pca_biplot(
+  pca_model,
+  geom.ind = "point",
+  pointsize = 0.5,
+  alpha.ind = 0.15,
+  label = "var",
+  repel = TRUE
+) +
+  labs(title = "PCA Biplot of Network-Flow Features")
+```
+
+#### Observation
+
+The biplot displays observations using PC1 and PC2 and shows the directions of the original feature loadings. Features with longer arrows contribute more strongly to these two principal components.
+
+### 5.6 Features Contributing Most to PC1 and PC2
+
+```{r pca-loadings}
+loading_data <- as.data.frame(pca_model$rotation[, 1:2]) %>%
+  rownames_to_column("Feature")
+
+top_pc1 <- loading_data %>%
+  mutate(Absolute_Loading = abs(PC1)) %>%
+  arrange(desc(Absolute_Loading)) %>%
+  slice_head(n = 8) %>%
+  select(Feature, PC1, Absolute_Loading)
+
+top_pc2 <- loading_data %>%
+  mutate(Absolute_Loading = abs(PC2)) %>%
+  arrange(desc(Absolute_Loading)) %>%
+  slice_head(n = 8) %>%
+  select(Feature, PC2, Absolute_Loading)
+
+kable(top_pc1, digits = 3, caption = "Top Contributors to PC1") %>%
+  kable_styling(full_width = FALSE)
+
+kable(top_pc2, digits = 3, caption = "Top Contributors to PC2") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The strongest contributor to PC1 is **`r top_pc1$Feature[1]`**, while the strongest contributor to PC2 is **`r top_pc2$Feature[1]`**. These features explain important directions of variation in the preprocessed network-flow data.
+
+### 5.7 PCA Interpretation and Modelling Decision
+
+PCA reduces dimensionality by replacing many original predictors with a smaller number of components. This is useful for understanding the structure of the feature space, but each principal component combines several original variables. As a result, PCA makes cybersecurity interpretation more difficult because a component is less intuitive than a feature such as duration or total packets.
+
+For this project, PCA is therefore used for dimensionality analysis, while the classification models are trained on the **original selected feature set**. This keeps the model inputs easier to explain during domain interpretation and the viva.
+
+## 6. Modelling
+
+### 6.1 Modelling Decisions
+
+Two classification models are used. **Logistic Regression** is the baseline because it is a simple and interpretable binary classifier. **Random Forest** is the improved model because it can learn non-linear relationships and interactions between network-flow variables.
+
+An **80/20 stratified train-test split** is used so that the training and test sets have similar class proportions. **5-fold cross-validation** is used because it provides repeated validation while keeping computation manageable. Random Forest uses **200 trees** to provide a stable ensemble without making the project unnecessarily slow. Three candidate `mtry` values are tested through `tuneLength = 3`, which gives a simple beginner-friendly hyperparameter search.
+
+### 6.2 Prepare the Modelling Dataset
+
+```{r final-model-data}
+final_model_data <- selected_data %>%
+  mutate(
+    attack_status = factor(
+      attack_status,
+      levels = c("Malicious", "Benign")
+    )
+  )
+
+glimpse(final_model_data)
+```
+
+#### Observation
+
+The positive class is set to **Malicious** because detecting attacks is the main goal of the classification task.
+
+### 6.3 Train-Test Split
+
+```{r train-test-split}
+set.seed(123)
+
+train_index <- caret::createDataPartition(
+  final_model_data$attack_status,
+  p = 0.80,
+  list = FALSE
+)
+
+train_data <- final_model_data[train_index, ]
+test_data <- final_model_data[-train_index, ]
+
+split_summary <- data.frame(
+  Dataset = c("Training", "Testing"),
+  Rows = c(nrow(train_data), nrow(test_data)),
+  Percentage = c(
+    round(nrow(train_data) / nrow(final_model_data) * 100, 1),
+    round(nrow(test_data) / nrow(final_model_data) * 100, 1)
+  )
+)
+
+kable(split_summary, caption = "80/20 Train-Test Split") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The training set contains approximately **80%** of the observations, while the remaining **20%** are kept separate for final evaluation.
+
+### 6.4 Training Class Distribution
+
+```{r training-class-distribution}
+train_class_table <- train_data %>%
+  count(attack_status) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+kable(train_class_table, caption = "Class Distribution in the Training Set") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The training set keeps the class structure of the full dataset. Because the classes are not perfectly balanced, Precision, Recall, F1-score, and ROC-AUC are evaluated together with Accuracy.
+
+### 6.5 Set Up 5-Fold Cross-Validation
+
+```{r cross-validation}
+set.seed(123)
+
+cv_control <- caret::trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = caret::twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+#### Observation
+
+In 5-fold cross-validation, the training data are divided into five parts. Each model trains on four parts and validates on the remaining part, and the process is repeated five times.
+
+### 6.6 Baseline Model: Logistic Regression
+
+```{r logistic-regression}
+set.seed(123)
+
+logistic_model <- caret::train(
+  attack_status ~ .,
+  data = train_data,
+  method = "glm",
+  family = binomial(),
+  metric = "ROC",
+  trControl = cv_control
+)
+
+logistic_model
+```
+
+#### Observation
+
+Logistic Regression provides the baseline performance. It is useful as a simple reference for judging whether the more flexible Random Forest model provides a meaningful improvement.
+
+### 6.7 Improved Model: Random Forest
+
+```{r random-forest}
+set.seed(123)
+
+random_forest_model <- caret::train(
+  attack_status ~ .,
+  data = train_data,
+  method = "rf",
+  metric = "ROC",
+  trControl = cv_control,
+  tuneLength = 3,
+  ntree = 200,
+  importance = TRUE
+)
+
+random_forest_model
+```
+
+#### Observation
+
+Random Forest combines 200 decision trees and can represent non-linear traffic patterns. The model tests three candidate `mtry` settings and selects the one with the strongest cross-validated ROC performance.
+
+### 6.8 Hyperparameter Tuning Results
+
+```{r hyperparameter-results}
+random_forest_model$results %>%
+  select(mtry, ROC, Sens, Spec) %>%
+  kable(
+    digits = 4,
+    caption = "Random Forest Cross-Validation Results"
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+random_forest_model$bestTune %>%
+  kable(caption = "Best Random Forest mtry Value") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The table reports every tested `mtry` value and its cross-validation performance. The selected value is **`r random_forest_model$bestTune$mtry[1]`** because it produced the best ROC score among the tested settings.
+
+## 7. Evaluation
+
+### 7.1 Test-Set Predictions
+
+```{r test-predictions}
+logistic_prediction <- predict(
+  logistic_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+rf_prediction <- predict(
+  random_forest_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+logistic_probability <- predict(
+  logistic_model,
+  newdata = test_data,
+  type = "prob"
+)$Malicious
+
+rf_probability <- predict(
+  random_forest_model,
+  newdata = test_data,
+  type = "prob"
+)$Malicious
+```
+
+#### Observation
+
+Each model produces a predicted class and a probability for the Malicious class. The probabilities are used to calculate ROC-AUC.
+
+### 7.2 Confusion Matrices
+
+```{r confusion-matrices}
+logistic_cm <- caret::confusionMatrix(
+  logistic_prediction,
+  test_data$attack_status,
+  positive = "Malicious"
+)
+
+rf_cm <- caret::confusionMatrix(
+  rf_prediction,
+  test_data$attack_status,
+  positive = "Malicious"
+)
+
+logistic_cm
+rf_cm
+```
+
+#### Observation
+
+The confusion matrices show correct predictions, false positives, and false negatives. False negatives are especially important because they represent malicious flows that were incorrectly classified as benign.
+
+### 7.3 ROC-AUC
+
+```{r roc-auc}
+logistic_roc <- pROC::roc(
+  response = test_data$attack_status,
+  predictor = logistic_probability,
+  levels = c("Benign", "Malicious"),
+  direction = "<",
+  quiet = TRUE
+)
+
+rf_roc <- pROC::roc(
+  response = test_data$attack_status,
+  predictor = rf_probability,
+  levels = c("Benign", "Malicious"),
+  direction = "<",
+  quiet = TRUE
+)
+
+logistic_auc <- as.numeric(pROC::auc(logistic_roc))
+rf_auc <- as.numeric(pROC::auc(rf_roc))
+
+auc_table <- data.frame(
+  Model = c("Logistic Regression", "Random Forest"),
+  ROC_AUC = c(logistic_auc, rf_auc)
+)
+
+kable(auc_table, digits = 4, caption = "Test-Set ROC-AUC") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+ROC-AUC measures how well each model separates malicious and benign flows across different probability thresholds. A value closer to 1 indicates stronger separation.
+
+### 7.4 Model Comparison Table
+
+```{r model-comparison}
+get_classification_metrics <- function(cm, auc_value, model_name) {
+  accuracy <- unname(cm$overall["Accuracy"])
+  precision <- unname(cm$byClass["Pos Pred Value"])
+  recall <- unname(cm$byClass["Sensitivity"])
+  f1 <- ifelse(
+    is.na(precision) || is.na(recall) || precision + recall == 0,
+    NA,
+    2 * precision * recall / (precision + recall)
+  )
+
+  data.frame(
+    Model = model_name,
+    Accuracy = accuracy,
+    Precision = precision,
+    Recall = recall,
+    F1 = f1,
+    ROC_AUC = auc_value
+  )
+}
+
+model_comparison <- bind_rows(
+  get_classification_metrics(
+    logistic_cm,
+    logistic_auc,
+    "Logistic Regression"
+  ),
+  get_classification_metrics(
+    rf_cm,
+    rf_auc,
+    "Random Forest"
+  )
+)
+
+best_model_row <- model_comparison %>%
+  arrange(desc(ROC_AUC)) %>%
+  slice(1)
+
+best_model_reason <- if (best_model_row$Model[1] == "Random Forest") {
+  paste(
+    "Random Forest may perform better because it can capture nonlinear",
+    "relationships and interactions between network-flow variables."
+  )
+} else {
+  paste(
+    "Logistic Regression may perform better because the selected features",
+    "may separate the classes using relatively simple relationships."
+  )
+}
+
+model_comparison %>%
+  mutate(
+    across(
+      c(Accuracy, Precision, Recall, F1, ROC_AUC),
+      ~ round(.x, 4)
+    )
+  ) %>%
+  kable(caption = "Test-Set Model Comparison") %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+```
+
+#### Observation
+
+The best model according to ROC-AUC is **`r best_model_row$Model[1]`**. Its Accuracy is **`r round(best_model_row$Accuracy[1], 3)`**, Precision is **`r round(best_model_row$Precision[1], 3)`**, Recall is **`r round(best_model_row$Recall[1], 3)`**, F1-score is **`r round(best_model_row$F1[1], 3)`**, and ROC-AUC is **`r round(best_model_row$ROC_AUC[1], 3)`**. `r best_model_reason`
+
+### 7.5 Confusion Matrix Visualisation
+
+```{r confusion-matrix-visualisation}
+cm_to_data <- function(cm, model_name) {
+  output <- as.data.frame(cm$table)
+  names(output) <- c("Prediction", "Actual", "Count")
+  output$Model <- model_name
+  output
+}
+
+confusion_plot_data <- bind_rows(
+  cm_to_data(logistic_cm, "Logistic Regression"),
+  cm_to_data(rf_cm, "Random Forest")
+)
+
+logistic_false_negatives <- logistic_cm$table["Benign", "Malicious"]
+rf_false_negatives <- rf_cm$table["Benign", "Malicious"]
+
+ggplot(
+  confusion_plot_data,
+  aes(x = Actual, y = Prediction, fill = Count)
+) +
+  geom_tile() +
+  geom_text(aes(label = Count), size = 5) +
+  facet_wrap(~ Model) +
+  labs(
+    title = "Confusion Matrices on the Test Set",
+    x = "Actual Class",
+    y = "Predicted Class"
+  )
+```
+
+#### Observation
+
+Logistic Regression misses **`r logistic_false_negatives`** malicious flows, while Random Forest misses **`r rf_false_negatives`**. In cybersecurity, the model with fewer false negatives is attractive because fewer attacks are allowed to pass undetected.
+
+### 7.6 ROC Curves
+
+```{r roc-curves}
+roc_plot_data <- bind_rows(
+  data.frame(
+    False_Positive_Rate = 1 - logistic_roc$specificities,
+    True_Positive_Rate = logistic_roc$sensitivities,
+    Model = "Logistic Regression"
+  ),
+  data.frame(
+    False_Positive_Rate = 1 - rf_roc$specificities,
+    True_Positive_Rate = rf_roc$sensitivities,
+    Model = "Random Forest"
+  )
+)
+
+ggplot(
+  roc_plot_data,
+  aes(
+    x = False_Positive_Rate,
+    y = True_Positive_Rate,
+    color = Model
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  coord_equal() +
+  labs(
+    title = "ROC Curves for the Classification Models",
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    color = "Model"
+  )
+```
+
+#### Observation
+
+A ROC curve closer to the upper-left corner indicates stronger class separation. The curves visually support the ROC-AUC values reported in the model comparison table.
+
+### 7.7 Check the Success Criteria
+
+```{r success-criteria-check}
+best_auc <- best_model_row$ROC_AUC[1]
+best_recall <- best_model_row$Recall[1]
+best_f1 <- best_model_row$F1[1]
+
+success_check <- data.frame(
+  Criterion = c(
+    "ROC-AUC >= 0.80",
+    "Malicious Recall >= 0.80",
+    "F1-score reported"
+  ),
+  Result = c(
+    round(best_auc, 3),
+    round(best_recall, 3),
+    round(best_f1, 3)
+  ),
+  Status = c(
+    ifelse(best_auc >= 0.80, "Met", "Not met"),
+    ifelse(best_recall >= 0.80, "Met", "Not met"),
+    ifelse(!is.na(best_f1), "Met", "Not met")
+  )
+)
+
+kable(success_check, caption = "Project Success Criteria") %>%
+  kable_styling(full_width = FALSE)
+```
+
+#### Observation
+
+The table directly connects the final test results to the success criteria defined in Section 1.3. A criterion marked `Not met` indicates an area where the model needs improvement rather than a reason to hide the result.
+
+### 7.8 Domain Interpretation
+
+Accuracy describes overall correctness, but it is not enough for an intrusion-detection problem. **Recall for the Malicious class is especially important** because low recall means that attacks are missed. Precision is also important because very low precision creates many false alarms for security analysts. F1-score balances precision and recall, while ROC-AUC evaluates overall class separation. Therefore, the final model should be judged using all of these measures together with the confusion matrix.
+
+## 8. Communication
+
+### 8.1 Executive Summary
+
+This project investigated whether real IoT network-flow information can be used to distinguish malicious traffic from benign traffic. The analysis used the IoT-23 CTU-IoT-Malware-Capture-34-1 scenario, a public Mirai malware capture from the Stratosphere Laboratory at the Czech Technical University in Prague. The dataset was loaded directly from the public repository and examined for variable types, missing values, extreme values, class balance, and relationships between traffic characteristics.
+
+During preprocessing, missing numeric values were treated with median imputation and missing categorical values were represented as `Unknown`. Exact duplicate rows were removed, while extreme network-flow observations were retained because unusual traffic can be meaningful in cybersecurity. New features were created to represent total bytes, total packets, bytes per packet, log-transformed traffic measurements, and time-of-day information. Categorical variables were one-hot encoded, continuous variables were standardised, and near-zero-variance and highly correlated predictors were removed.
+
+PCA was then used to study the dimensionality of the selected predictors. The first **`r selected_pc_count`** components explained approximately **`r round(selected_pc_variance, 2)`%** of the total variance. Logistic Regression was used as the baseline model and Random Forest as the improved model, with an 80/20 train-test split and 5-fold cross-validation. On the independent test set, **`r best_model_row$Model[1]`** achieved the highest ROC-AUC of **`r round(best_model_row$ROC_AUC[1], 3)`**. The findings show that network-flow behaviour contains useful information for intrusion detection, although results from one Mirai capture should not be assumed to generalise to every network, IoT device, or attack family.
+
+### 8.2 Publication-Quality Figure
+
+The following figure directly addresses Research Question 2 by comparing total network traffic volume between benign and malicious flows.
+
+```{r publication-figure}
+traffic_volume_summary <- clean_data %>%
+  group_by(attack_status) %>%
+  summarise(
+    Median_Total_Bytes = median(total_bytes, na.rm = TRUE),
+    Mean_Total_Bytes = mean(total_bytes, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(
+  traffic_volume_summary,
+  digits = 2,
+  caption = "Traffic Volume Summary by Class"
+) %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(
+  clean_data,
+  aes(
+    x = attack_status,
+    y = log1p(total_bytes),
+    fill = attack_status
+  )
+) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.8) +
+  labs(
+    title = "Network Traffic Volume by Traffic Class",
+    subtitle = "IoT-23 Mirai capture: Benign versus Malicious flows",
+    x = "Traffic Class",
+    y = "log(1 + Total Bytes)",
+    caption = "Source: IoT-23, CTU-IoT-Malware-Capture-34-1"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+#### Observation
+
+The median total bytes are **`r round(traffic_volume_summary$Median_Total_Bytes[traffic_volume_summary$attack_status == "Benign"], 2)`** for benign flows and **`r round(traffic_volume_summary$Median_Total_Bytes[traffic_volume_summary$attack_status == "Malicious"], 2)`** for malicious flows. The figure shows that traffic volume has a different distribution across the two classes and can contribute useful information to intrusion detection.
+
+## 9. Reflection
+
+### 9.1 Limitations
+
+**Limitation 1 — Single malware scenario:** The analysis uses only CTU-IoT-Malware-Capture-34-1. The results mainly reflect Mirai behaviour and may not generalise to other attack families, enterprise networks, cloud systems, or different IoT devices.
+
+**Limitation 2 — Class distribution and capture environment:** The proportion of benign and malicious flows in this capture may not match a normal operational network. Model performance may also depend on patterns that are specific to the CTU experimental environment.
+
+**Limitation 3 — Flow-level information:** The models use Zeek connection-flow features instead of complete packet payloads. This reduces privacy risk and keeps the project manageable, but some detailed attack information may not be represented.
+
+### 9.2 Ethical Considerations
+
+Network datasets can contain sensitive information such as IP addresses, communication patterns, and device behaviour. This project excludes source and destination IP addresses from the modelling predictors to reduce unnecessary use of identifying network information.
+
+Bias and fairness are also important. A model trained mainly on one malware family or one device can perform poorly on other devices or traffic patterns. False positives can incorrectly flag legitimate activity, while false negatives can allow attacks to pass undetected. For this reason, an intrusion-detection model should support security analysts rather than make high-impact decisions without human review.
+
+### 9.3 Future Work
+
+1. **Use multiple IoT-23 scenarios:** Combine several malware and benign captures and evaluate whether the models generalise across attack families and devices.
+2. **Improve class-imbalance handling:** Compare class weighting, resampling, and probability-threshold adjustment to reduce missed attacks without creating too many false alarms.
+3. **External validation:** Test the final model on a different real intrusion-detection dataset or on traffic collected from another network environment.
+
+## Final Conclusion
+
+This cumulative report covers the complete data science workflow required for the semester project. It frames the cybersecurity problem, loads a real dataset directly from a public URL, performs data inspection and EDA, treats missing values and outliers, engineers and selects features, applies PCA, trains a baseline and an improved classification model with cross-validation, evaluates the models using appropriate classification metrics, communicates the findings, and reflects on limitations, ethics, and future work.
